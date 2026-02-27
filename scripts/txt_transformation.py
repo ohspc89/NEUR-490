@@ -28,6 +28,9 @@ R_POSITIVE = {"P"}
 R_NEG_LA = {"NPB", "NPL"}
 R_NEG_RA = {"NPB", "NPR"}
 
+INFANT_VALID_MOVES = ["MDG", "MDT", "MDX"]
+PRE_BUFFER_ms = 500
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ELAN output preprocessing")
     p.add_argument("input_dir", help="directory containing .txt files")
@@ -89,6 +92,87 @@ def code_infant_behav(label: str, default: Optional[int] = None) -> Optional[int
     return INFANT_BEHAV_CODE.get(label, default)
 
 
+def count_episodes(sub_r):
+    """
+    Count episodes, which are defined as:
+        P onset -> first subsequent NP* onset
+    NP* includes NPR, NPL, NPB.
+    This operationally marks the end of a presentation episode,
+    regardless of which hand caused the termination.
+    """
+    sub_r = sub_r.sort_values("start_ms")
+    category = ["NP", "NPB", "NPR", "NPL"]
+    episodes = []
+
+    for i, (_, rr) in enumerate(sub_r.iterrows()):
+        if rr["label"] in category:
+            if i == 0:
+                continue
+            else:
+                if sub_r["label"].iloc[i-1] == "P":
+                    episodes.append((sub_r["start_ms"].iloc[i-1],
+                                     sub_r["end_ms"].iloc[i-1],
+                                     rr["start_ms"]))
+    return episodes
+
+
+def truncate_LA_RA(sub: pd.DataFrame, episodes: list) -> pd.DataFrame:
+    """
+    Infant MD* intervals are truncated at NP onset
+    to approximate the end of the reaching phase.
+    The remaining segment after NP onset (INV) reflects
+    holding/manipulation and is excluded from reach analysis.
+    """
+    out = []
+    drop_idx = []
+    for k, ir in sub.iterrows():
+        if ir["label"] not in INFANT_VALID_MOVES:
+            continue
+
+        best = None
+        for ep_idx, ep in enumerate(episodes):
+        # compute overlap with P window
+            ov = max(0, min(ir["end_ms"], ep[1]) - max(ir["start_ms"], ep[0]))
+            if ov <= 0:
+                continue
+
+            # optional: onset must not precede P too much
+            if ir["start_ms"] < ep[0] - PRE_BUFFER_ms:
+                continue
+
+            if best is None or ov > best["ov"]:
+                best = {"idx": ep_idx, "ov": ov, "np_on": ep[2]}
+
+        if best is None:
+            continue
+
+        new_off = min(ir["end_ms"], best["np_on"])
+        if new_off > ir["start_ms"]:
+            new_row1 = dict(zip(ir.index,
+                            [ir["start_ms"], new_off, ir['label']]
+                           )
+                       )
+
+            # INV intervals are kept as a distinct level.
+            # In subsequent CRQA preprocessing, only 1-1 matches are counted,
+            # so INV (coded as non-7) does not contribute to recurrence.
+            new_row2 = dict(zip(ir.index,
+                            [new_off, ir["end_ms"], "INV"]
+                           )
+                       )
+            out.append(new_row1)
+            if new_off != ir["end_ms"]:
+                out.append(new_row2)
+
+            drop_idx.append(k)
+
+    to_add = pd.DataFrame(out)
+    sub_filtered = sub.drop(index=drop_idx)
+    final = pd.concat((sub_filtered, to_add))
+
+    return final.sort_values(by="start_ms")
+
+
 def process_LA_RA(subset: pd.DataFrame,
                   interval_ms: int,
                   overlap_mode: str,
@@ -110,21 +194,21 @@ def process_LA_RA(subset: pd.DataFrame,
         val = code_infant_behav(row.label, unknown_value)
         series[mask] = val
 
-        # Tail-short fix:
-        # If leftover time after the last annotation  is shorter than threshold,
-        # copy the preceding bin's value into the last bin.
-        if len(series) >= 2:
-            last_annot_end = int(subset["end_ms"].max())
-            tail = end_time - last_annot_end
-            threshold = tail_short_threshold_ms if tail_short_threshold_ms is not None else (interval_ms // 2)
-            if 0 < tail < threshold:
-                series[-1] == series[-2]
+    # Tail-short fix:
+    # If leftover time after the last annotation  is shorter than threshold,
+    # copy the preceding bin's value into the last bin.
+    if len(series) >= 2:
+        last_annot_end = int(subset["end_ms"].max())
+        tail = end_time - last_annot_end
+        threshold = tail_short_threshold_ms if tail_short_threshold_ms is not None else (interval_ms // 2)
+        if 0 < tail < threshold:
+            series[-1] = series[-2]
 
-        out = pd.DataFrame({
-            "time_ms": left_edges[:-1],
-            "center_ms": centers,
-            "binary_value": series.astype(int, copy=False)
-            })
+    out = pd.DataFrame({
+        "time_ms": left_edges[:-1],
+        "center_ms": centers,
+        "binary_value": series.astype(int, copy=False)
+        })
     return out
 
 
@@ -183,8 +267,21 @@ def main():
 
     for file in txt_files:
         print(f"\n[FILE] {file.name}")
+        # We first need to trim LA and RA tier
+        sub_R  = load_subset(file, "R")
+        sub_LA = load_subset(file, "LA")
+        sub_RA = load_subset(file, "RA")
+
+        episodes = count_episodes(sub_R)
+
+        # Truncate and update the original DataFrames
+        sub_LA = truncate_LA_RA(sub_LA, episodes)
+        sub_RA = truncate_LA_RA(sub_RA, episodes)
+
+        # sub_LA.to_csv(file.stem + "_LA_new.csv")
+        # sub_RA.to_csv(file.stem + "_RA_new.csv")
+
         # R tier
-        sub_R = load_subset(file, "R")
         df_R_L, df_R_R = process_R(
             sub_R, args.interval_ms, args.overlap_mode, args.unknown_value,
             args.tail_short_threshold_ms
@@ -197,7 +294,6 @@ def main():
             print("  [SKIP] No valid R tier rows or missing end_ms.")
 
         # LA tier
-        sub_LA = load_subset(file, "LA")
         df_LA = process_LA_RA(
             sub_LA, args.interval_ms, args.overlap_mode,
             args.unknown_value,
@@ -210,7 +306,6 @@ def main():
             print("  [SKIP] No valid LA tier rows or missing end_ms.")
 
         # RA tier
-        sub_RA = load_subset(file, "RA")
         df_RA = process_LA_RA(
             sub_RA, args.interval_ms, args.overlap_mode,
             args.unknown_value,
