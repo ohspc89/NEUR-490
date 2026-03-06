@@ -29,7 +29,9 @@ R_NEG_LA = {"NPB", "NPL"}
 R_NEG_RA = {"NPB", "NPR"}
 
 INFANT_VALID_MOVES = ["MDG", "MDT", "MDX"]
-PRE_BUFFER_ms = 500
+# The time difference between an occurrence of any of `INFANT_VALID_MOVES`
+# and its nearest P should be less than this number:
+PRE_BUFFER_ms = 1000
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="ELAN output preprocessing")
@@ -65,7 +67,8 @@ def load_subset(filepath: Path, tier: str) -> pd.DataFrame:
     )
     # This is unnecessary, but just in case
     subset["label"] = subset["label"].astype(str).str.strip().str.upper()
-    return subset
+    # Sort by start_ms
+    return subset.sort_values(by='start_ms')
 
 
 def build_bins(end_time_ms: int, interval_ms: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -108,11 +111,10 @@ def count_episodes(sub_r):
         if rr["label"] in category:
             if i == 0:
                 continue
-            else:
-                if sub_r["label"].iloc[i-1] == "P":
-                    episodes.append((sub_r["start_ms"].iloc[i-1],
-                                     sub_r["end_ms"].iloc[i-1],
-                                     rr["start_ms"]))
+            if sub_r["label"].iloc[i-1] == "P":
+                episodes.append((sub_r["start_ms"].iloc[i-1],
+                                 sub_r["end_ms"].iloc[i-1],
+                                 rr["start_ms"]))
     return episodes
 
 
@@ -170,7 +172,7 @@ def truncate_LA_RA(sub: pd.DataFrame, episodes: list) -> pd.DataFrame:
     sub_filtered = sub.drop(index=drop_idx)
     final = pd.concat((sub_filtered, to_add))
 
-    return final.sort_values(by="start_ms")
+    return final.sort_values(by="start_ms").reset_index(drop=True)
 
 
 def process_LA_RA(subset: pd.DataFrame,

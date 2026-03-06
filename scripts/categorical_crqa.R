@@ -40,7 +40,7 @@ embed       <- 1
 rescale     <- 0
 radius      <- 0.001
 normalize   <- 0
-mindiagline <- 3
+mindiagline <- 6
 minvertline <- 2
 tw          <- 2
 whiteline   <- F
@@ -117,6 +117,155 @@ index_files <- function(all_files, id, mon, trial) {
         filter(!is.na(hand))
 }
 
+# Shared, fixed level set used by BOTH series
+# Include ZERO only if you intend to allow 0-0 matches
+CAT_LEVELS <- c("ONE", "POTHER", "IOTHER")
+
+# Categorical to numeric
+encode_categorical <- function(x) {
+    as.integer(factor(x, levels=CAT_LEVELS))
+}
+
+drp_from_rp_idx <- function(RP,
+                            maxlag    = 50L,
+                            theiler   = 0L,    # set RR=NA for |lag| <= theiler
+                            as_percent = TRUE,
+                            bin_ms    = 100L) {
+  # Coerce to compressed sparse column for fast indexing
+  RP <- as(RP, "dgCMatrix")
+  n  <- nrow(RP)
+  stopifnot(ncol(RP) == n)
+
+  maxlag <- as.integer(min(maxlag, n - 1L))
+  lags   <- (-maxlag):maxlag
+
+  # For each lag k, index the k-th diagonal explicitly.
+  # If k >= 0: positions (i, j) = (1:(n-k), (1+k):n)
+  # If k <  0: let d = -k, positions (i, j) = ((1+d):n, 1:(n-d))
+  band_rr <- vapply(lags, function(k) {
+    if (abs(k) <= theiler) return(NA_real_)  # apply Theiler window at profile level
+
+    if (k >= 0L) {
+      if (n - k <= 0L) return(NA_real_)
+      i <- seq.int(1L, n - k)
+      j <- seq.int(1L + k, n)
+    } else {
+      d <- -k
+      if (n - d <= 0L) return(NA_real_)
+      j <- seq.int(1L, n - d)
+      i <- j + d
+    }
+
+    # Extract those positions; RP[...] returns numeric 0/1 for dgCMatrix
+    v <- RP[cbind(i, j)]
+    if (!length(v)) return(NA_real_)
+    mean(v != 0)   # proportion of 1s on that diagonal
+  }, numeric(1))
+
+  if (as_percent) band_rr <- 100 * band_rr
+  df <- data.frame(lag = lags, RR = band_rr)
+
+  df
+}
+
+plot_drp <- function(df) {
+  p <- ggplot(df, aes(lag, RR)) +
+    geom_hline(yintercept = 0, color = "grey80") +
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    geom_line(na.rm = TRUE, linewidth = 0.9) +
+    labs(
+      title = "Diagonal Cross-Recurrence Profile (computed from RP)",
+      x = sprintf("Lag (bins; 1 bin = %d ms)", bin_ms),
+      y = if (as_percent) "Recurrence Rate (%)" else "Recurrence (proportion)"
+    ) +
+    theme_minimal(base_size = 12)
+
+  # Annotate the peak if any non-NA values exist
+  if (any(!is.na(df$RR))) {
+    df2  <- df[!is.na(df$RR), ]
+    peak <- df2[which.max(df2$RR), ]
+    p <- p + annotate(
+      "text", x = peak$lag * 0.9, y = peak$RR,
+      label = sprintf("Peak: %d bins (~%d ms), RR = %.2f%s",
+                      peak$lag, peak$lag * bin_ms, peak$RR, if (as_percent) "%" else ""),
+      vjust = -0.8, size = 3.6
+    )
+  }
+  p
+}
+
+
+# Diagonal cross-recurrence profile
+compute_dcrp <- function(ts1_num, ts2_num, ws_bins=50,
+                         delay=1, embed=1,
+                         rescale=0, radius=0.001, normalize=0,
+                         method="crqa", metric="euclidean",
+                         datatype="categorical", bin_ms=100) {
+
+    drp <- drpfromts(ts1=ts1_num, ts2=ts2_num, windowsize=ws_bins,
+                     method=method, datatype=datatype,
+                     delay=delay, embed=embed,
+                     rescale=rescale, radius=radius, normalize=normalize,
+                     metric=metric)
+
+    # drpdfromts returns a list with 'profile', 'maxrec', and 'delay'
+    prof <- as.numeric(drp$profile)
+    lags <- seq(-ws_bins, ws_bins)
+    if (length(prof) == length(lags)) {
+        pos_idx <- which(lags > 0)
+        neg_idx <- which(lags < 0)
+
+        pos_auc <- if (length(pos_idx)) sum(prof[pos_idx]) else 0
+        neg_auc <- if (length(neg_idx)) sum(prof[neg_idx]) else 0
+
+        asymmetry <- if ((pos_auc + neg_auc) > 0) {
+            (pos_auc - neg_auc) / (pos_auc + neg_auc)
+        } else {
+            NA_real_
+        }
+
+        # Peak lag (bins and ms)
+        peak_idx <- which.max(prof)
+        peak_idx_positive <- which.max(prof[51:length(prof)])
+        peak_lag_bins <- lags[peak_idx]
+        peak_lag_bins_positive <- lags[50+peak_idx_positive]
+        peak_lag_ms <- peak_lag_bins * bin_ms
+        peak_lag_ms_positive <- peak_lag_bins_positive * bin_ms
+        peak_rr <- prof[peak_idx]
+        peak_rr_positive <- prof[peak_idx_positive+50]
+
+        list(
+             df = tibble(lag_bins = lags,
+                         lag_ms = lags * bin_ms,
+                         rr = prof),
+             peak_lag_bins = peak_lag_bins,
+             peak_lag_bins_positive = peak_lag_bins_positive,
+             peak_lag_ms = peak_lag_ms,
+             peak_lag_ms_positive = peak_lag_ms_positive,
+             peak_rr = peak_rr,
+             peak_rr_positive = peak_rr_positive,
+             pos_auc = pos_auc,
+             neg_auc = neg_auc,
+             asymmetry = asymmetry
+             )
+    } else {
+        list(
+             df = tibble(lag_bins = NA,
+                         lag_ms = NA,
+                         rr = NA),
+             peak_lag_bins = NA,
+             peak_lag_bins_positive = NA, 
+             peak_lag_ms = NA,
+             peak_lag_ms_positive = NA,
+             peak_rr = NA,
+             peak_rr_positive = NA,
+             pos_auc = NA,
+             neg_auc = NA,
+             asymmetry = NA
+             )
+    }
+}
+
 # One CRQA run for a (presenter_file, infant_file) pair.
 run_one_crqa <- function(presenter_file, infant_file, hand, id, mon, trial) {
     pf <- file.path(data.path, presenter_file)
@@ -140,9 +289,12 @@ run_one_crqa <- function(presenter_file, infant_file, hand, id, mon, trial) {
     ts_presenter <- map_presenter(as.integer(dat$presenter))
     ts_infant    <- map_infant(as.integer(dat$infant))
 
+    ts1_num <- encode_categorical(ts_presenter)
+    ts2_num <- encode_categorical(ts_infant)
+
     # Run CRQA (categorical exact match)
-    ans <- crqa(ts1 = ts_presenter,
-                ts2 = ts_infant,
+    ans <- crqa(ts1 = ts1_num,
+                ts2 = ts2_num,
                 delay = delay, embed = embed,
                 rescale = rescale, radius = radius, normalize = normalize,
                 mindiagline = mindiagline, minvertline = minvertline,
@@ -162,10 +314,35 @@ run_one_crqa <- function(presenter_file, infant_file, hand, id, mon, trial) {
 #  - LAM (Laminarity): Fraction of recurrent points that form vertical lines. Very high LAM means a lot of "sticking" in one series while the other continues to yield matches.
     out <- as.data.frame(ans[c("RR", "DET", "L", "maxL", "ENTR", "LAM", "TT", "max_vertlength")])
 
+    # DCRP: RR as a function of lag
+    # Choose a lag window that makes sense for your behavior.
+    # With 100 ms bins, ws_bins = 50 -> +/- 5s
+    ws_bins <- 50
+    # lag_RR <- drp_from_rp_idx(ans$RP, plot=F)
+    # max_lag <- which.max(lag_RR[lag_RR$lag > 0, 'RR'])
+    dcrp <- compute_dcrp(ts1_num, ts2_num, ws_bins=ws_bins,
+                         delay=delay, embed=embed,
+                         rescale=rescale, radius=radius, normalize=normalize,
+                         method=method, metric=metric, datatype=datatype,
+                         bin_ms=100)
+
     # Safer stem (remove .csv robustly even if name contains multiple dots)
     stem <- sub("\\.csv$", "", infant_file)
-    out_name <- paste0(stem, "_crqa_results.csv")
+    dcrp_csv <- file.path(data.output.path, paste0(stem, "_dcrp.csv"))
+    write_csv(dcrp$df, dcrp_csv)
 
+    # peak lag and asymmetric
+    out$peak_lag_bins <- dcrp$peak_lag_bins
+    out$peak_lag_ms   <- dcrp$peak_lag_ms
+    out$peak_rr       <- dcrp$peak_rr
+    out$pos_auc       <- dcrp$pos_auc
+    out$neg_auc       <- dcrp$neg_auc
+    out$asymmetry     <- dcrp$asymmetry
+    out$peak_lag_bins_positive <- dcrp$peak_lag_bins_positive
+    out$peak_lag_ms_positive   <- dcrp$peak_lag_ms_positive
+    out$peak_rr_positive       <- dcrp$peak_rr_positive
+
+    out_name <- paste0(stem, "_crqa_results.csv")
     write.csv(out, file = file.path(data.output.path, out_name), row.names=F)
     message(sprintf("[OK] %s %s A%d %s -> %s", id, mon, trial, hand, out_name))
     rp.plot <- plot_rp(ans$RP,
@@ -174,9 +351,21 @@ run_one_crqa <- function(presenter_file, infant_file, hand, id, mon, trial) {
                        title = "Categorical Cross-Recurrence Plot"
                        )
     rp_path <- file.path(fig.output.path, paste0(stem, "_rp.png"))
-    print(rp_path)
     ggplot2::ggsave(filename=rp_path, plot=rp.plot, dpi=300, width=5, height=5, units="in")
-    out
+    # dev.off()
+
+    # RR(lag) plots
+    dcrp_plot_path <- file.path(fig.output.path, paste0(stem, "_dcrp.png"))
+    ggplot(dcrp$df, aes(x=lag_ms, y=rr)) +
+        geom_line(color = "#2c7fb8", linewidth=1) +
+        geom_vline(xintercept=0, linetype="dashed", color="grey50") +
+        geom_vline(xintercept=dcrp$peak_lag_ms, color="#d95f0e") +
+        labs(x="Lag (ms; + infant follows)",
+             y="Recurrence rate",
+             title=sprintf("DCRP (peak: %d ms, RR=%.3f)", dcrp$peak_lag_ms,
+                           dcrp$peak_rr)) +
+        theme_minimal(base_size=12)
+    ggsave(filename=dcrp_plot_path, dpi=300, width=6, height=4, units="in")
 }
 
 # --- MAIN ---
