@@ -26,7 +26,7 @@ def iqr(series):
     return q3 - q1
 
 
-subj = ep.groupby("subject").agg(
+subj = ep.groupby(["subject", "month"]).agg(
     n_episodes=("episode_idx", "count"),
 
     # response rate (any-hand)
